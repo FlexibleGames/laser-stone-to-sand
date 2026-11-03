@@ -1,185 +1,264 @@
-// Laser Stone to Sand — main thread.
-// The entry is compiled as an async function body. No import/export.
+// Stone to Sand — main thread.
+// Any excavation that clears stone leaves sand behind. This does not set
+// profileId, so another mod can still own the void gun's dig profile.
 
-const PROFILE_ID = "laser-stone-to-sand.profile";
+const BUFFER_KEY = "stoneToSand";
+const RING = 8192;
+const HEADER = 5;
+const LENGTH = HEADER + RING;
+const DEFAULT_SAND = 6;
+
 const api = sandkit.api;
+const NEIGHBORS = buildNeighbors(6);
+const jobs = [];
+let hooked = false;
+let buffer;
 
-let installed = false;
+function buildNeighbors(maxRadius) {
+  const list = [];
+  for (let r = 0; r <= maxRadius; r++) {
+    for (let y = -r; y <= r; y++) {
+      for (let x = -r; x <= r; x++) {
+        if (Math.max(Math.abs(x), Math.abs(y)) === r) list.push([x, y]);
+      }
+    }
+  }
+  return list;
+}
 
-function isEnabled() {
+function clampAmount(value) {
+  if (typeof value !== "number" || !isFinite(value)) return null;
+  return Math.max(1, Math.min(16, Math.round(value)));
+}
+
+function readAmount() {
+  try {
+    const value = api.settings.get("sandPerStone");
+    const direct = clampAmount(value);
+    if (direct !== null) return direct;
+    if (value && typeof value === "object") {
+      const nested = clampAmount(value.sandPerStone);
+      if (nested !== null) return nested;
+    }
+  } catch (error) {}
+  if (buffer && buffer[2] > 0) return clampAmount(buffer[2]) || DEFAULT_SAND;
+  return DEFAULT_SAND;
+}
+
+function readEnabled() {
   try {
     const value = api.settings.get("enabled");
     if (typeof value === "boolean") return value;
     if (value && typeof value.enabled === "boolean") return value.enabled;
   } catch (error) {}
+  if (buffer && buffer[1] === 2) return false;
   return true;
 }
 
-function resolveType(getter, ids) {
-  for (let i = 0; i < ids.length; i++) {
-    try {
-      const value = getter(ids[i]);
-      if (value !== null && value !== undefined) return value;
-    } catch (error) {}
-  }
-  return null;
-}
-
-function laserPower() {
+function syncConfig() {
+  buffer = getBuffer();
+  if (!buffer) return;
   try {
-    const value = api.gameConfig.get("laser:excavationPower");
-    if (typeof value === "number" && isFinite(value) && value > 0) return value;
+    buffer[1] = readEnabled() ? 1 : 2;
+    buffer[2] = readAmount();
   } catch (error) {}
-  return 1;
 }
 
-function registerProfile() {
-  const stoneType = resolveType(
-    (id) => api.terrains.getTypeById(id),
-    ["stone", "Stone"],
-  );
-  const sandType = resolveType(
-    (id) => api.elements.getTypeById(id),
-    ["sand", "Sand"],
-  );
-  if (stoneType === null || sandType === null) return false;
+function getBuffer() {
+  if (buffer) return buffer;
+  try {
+    buffer = api.shared.buffers.ensure(BUFFER_KEY, { type: "int32", length: LENGTH });
+  } catch (error) {
+    try {
+      buffer = api.shared.buffers.get(BUFFER_KEY);
+    } catch (inner) {
+      buffer = null;
+    }
+  }
+  return buffer;
+}
+
+function claim(x, y) {
+  const buf = getBuffer();
+  if (!buf) return true;
+  let token = ((((x & 0xffff) << 16) | (y & 0xffff)) ^ 0x5a5a5a5a) | 0;
+  if (token === 0) token = 1;
+
+  const finish = () => {
+    for (let i = 0; i < RING; i++) {
+      if ((buf[HEADER + i] | 0) === token) return false;
+    }
+    const head = buf[4] | 0;
+    buf[HEADER + (head % RING)] = token;
+    buf[4] = (head + 1) % RING;
+    return true;
+  };
 
   try {
-    api.excavation.registerProfile(PROFILE_ID, {
-      // Match the laser's own dig power so this profile doesn't buff or nerf it.
-      power: laserPower(),
-      terrainRules: [
-        {
-          cellType: stoneType,
-          outputElementType: sandType,
-        },
-      ],
-    });
-  } catch (error) {
-    // The worker entry may have registered the same id already.
-  }
-  return true;
-}
-
-function isLaser(args) {
-  return !!args && String(args.sourceId).toLowerCase() === "laser";
-}
-
-// Backup for when the profile rule doesn't emit a grain. No-ops if the
-// cell already holds the sand the profile just created.
-function watchClearedStone(cells, triesLeft) {
-  const place = (writer) => {
-    const still = [];
-    for (let i = 0; i < cells.length; i++) {
-      const cell = cells[i];
-      let isStone = false;
-      try {
-        isStone = api.terrains.isTypeAtCell(cell.x, cell.y, "stone");
-      } catch (error) {}
-      if (isStone) {
-        still.push(cell);
-        continue;
-      }
-      let empty = false;
-      try {
-        empty = api.grid.isCellEmptyAtCell(cell.x, cell.y);
-      } catch (error) {}
-      if (!empty) continue;
-      writer.elements.createAtCell(cell.x, cell.y, "sand");
+    let spins = 0;
+    while (Atomics.compareExchange(buf, 0, 0, 1) !== 0) {
+      if (++spins > 10000) return finish();
     }
-    // Retry only for cells this dig has not cleared yet. A chip that
-    // leaves the stone standing does not drop sand.
-    if (still.length > 0 && triesLeft > 1 && api.schedule && api.schedule.nextTick) {
-      const retry = still;
-      api.schedule.nextTick(() => watchClearedStone(retry, triesLeft - 1));
-    }
-  };
-
-  const run = () => {
     try {
-      api.grid.mutate(place);
-    } catch (error) {
-      try {
-        api.world.runWhenSimulationIdle(() => place({
-          elements: {
-            createAtCell: (x, y, id) => api.elements.createAtCell(x, y, id),
-          },
-        }));
-      } catch (inner) {}
+      return finish();
+    } finally {
+      Atomics.store(buf, 0, 0);
     }
-  };
-
-  if (api.schedule && api.schedule.nextTick) api.schedule.nextTick(run);
-  else run();
+  } catch (error) {
+    return finish();
+  }
 }
 
-function stoneCellsInBeam(args) {
+function isStone(x, y) {
+  try {
+    return !!api.terrains.isTypeAtCell(x, y, "stone");
+  } catch (error) {
+    return false;
+  }
+}
+
+function isSand(x, y) {
+  try {
+    return !!api.elements.isTypeAtCell(x, y, "sand");
+  } catch (error) {
+    return false;
+  }
+}
+
+function isEmpty(x, y) {
+  try {
+    if (api.grid && api.grid.isCellEmptyAtCell) return !!api.grid.isCellEmptyAtCell(x, y);
+  } catch (error) {}
+  try {
+    if (api.world && api.world.isCellEmptyAtCell) return !!api.world.isCellEmptyAtCell(x, y);
+  } catch (error) {}
+  return false;
+}
+
+function snapshot(args) {
+  if (!args || !isFinite(args.originCellX) || !isFinite(args.originCellY)) return [];
+  let diameter = 9;
+  if (isFinite(args.patternDiameterCells) && args.patternDiameterCells >= 1) {
+    diameter = Math.floor(args.patternDiameterCells);
+  }
+  if (diameter > 75) diameter = 75;
+  const radius = Math.floor(diameter / 2);
   const originX = args.originCellX;
   const originY = args.originCellY;
-  if (!isFinite(originX) || !isFinite(originY)) return [];
-
-  // patternSize in config/laser.json is 7. Cap so a range-sized value
-  // (maxRangeCells is 250) can't scan the whole map every tick.
-  let diameter = 7;
-  if (isFinite(args.patternDiameterCells) && args.patternDiameterCells >= 1) {
-    diameter = args.patternDiameterCells;
-  }
-  if (diameter > 31) diameter = 31;
-  const radius = Math.floor(diameter / 2);
   const cells = [];
-
   for (let y = originY - radius; y <= originY + radius; y++) {
     for (let x = originX - radius; x <= originX + radius; x++) {
-      let isStone = false;
-      try {
-        isStone = api.terrains.isTypeAtCell(x, y, "stone");
-      } catch (error) {}
-      if (isStone) cells.push({ x: x, y: y });
+      if (isStone(x, y)) cells.push({ x: x, y: y });
     }
   }
   return cells;
 }
 
-function install() {
-  if (installed) return true;
-  let registered = false;
-  try {
-    registered = registerProfile();
-  } catch (error) {
-    registered = false;
+function dropSand(writer, cells, amount) {
+  const still = [];
+  for (let i = 0; i < cells.length; i++) {
+    const cell = cells[i];
+    if (isStone(cell.x, cell.y)) {
+      still.push(cell);
+      continue;
+    }
+    if (!claim(cell.x, cell.y)) continue;
+    let placed = isSand(cell.x, cell.y) ? 1 : 0;
+    for (let n = 0; n < NEIGHBORS.length && placed < amount; n++) {
+      const x = cell.x + NEIGHBORS[n][0];
+      const y = cell.y + NEIGHBORS[n][1];
+      if (!isEmpty(x, y)) continue;
+      if (writer && writer.elements && writer.elements.createAtCell) {
+        writer.elements.createAtCell(x, y, "sand");
+      } else {
+        api.elements.createAtCell(x, y, "sand");
+      }
+      placed++;
+    }
   }
-  if (!registered) return false;
+  return still;
+}
 
-  api.hooks.modify("excavation:prepare", (args) => {
-    if (!isEnabled() || !isLaser(args)) return;
-    args.profileId = PROFILE_ID;
+function remember(cells) {
+  if (!cells.length) return;
+  jobs.push({ cells: cells, tries: 6 });
+  kick();
+}
+
+let pumping = false;
+
+function kick() {
+  if (pumping) return;
+  pumping = true;
+  const step = () => {
+    const amount = readAmount();
+    const run = (writer) => {
+      for (let i = jobs.length - 1; i >= 0; i--) {
+        const job = jobs[i];
+        job.cells = dropSand(writer, job.cells, amount);
+        job.tries -= 1;
+        if (!job.cells.length || job.tries <= 0) jobs.splice(i, 1);
+      }
+      if (jobs.length && api.schedule && api.schedule.nextTick) {
+        api.schedule.nextTick(step);
+      } else {
+        pumping = false;
+      }
+    };
     try {
-      const cells = stoneCellsInBeam(args);
-      if (cells.length > 0) watchClearedStone(cells, 6);
-    } catch (error) {}
-  }, { priority: 0 });
+      api.grid.mutate(run);
+    } catch (error) {
+      try {
+        api.world.runWhenSimulationIdle(() => run(null));
+      } catch (inner) {
+        pumping = false;
+      }
+    }
+  };
+  if (api.schedule && api.schedule.nextTick) api.schedule.nextTick(step);
+  else step();
+}
 
-  installed = true;
-  return true;
+function giveStoneASandOutput() {
+  try {
+    const stoneType = api.terrains.getTypeById("stone");
+    const sandType = api.elements.getTypeById("sand");
+    if (stoneType == null || sandType == null) return;
+    api.terrains.updateDefinition(stoneType, {
+      output: { elementType: sandType, chance: 1 },
+    });
+  } catch (error) {}
+}
+
+function install() {
+  if (hooked) return;
+  syncConfig();
+  giveStoneASandOutput();
+  api.hooks.modify("excavation:prepare", (args) => {
+    syncConfig();
+    if (!readEnabled()) return;
+    try {
+      remember(snapshot(args));
+    } catch (error) {}
+  }, { priority: 1000 });
+  hooked = true;
 }
 
 install();
 
 try {
+  api.settings.onChange(() => syncConfig());
+} catch (error) {}
+
+try {
   api.events.on("game:ready", () => {
-    const ok = install();
+    install();
     try {
-      api.ui.toast(
-        ok
-          ? "Stone drops sand when you mine it with the laser."
-          : "Laser Stone to Sand couldn't find stone or sand.",
-      );
+      api.ui.toast("Broken stone drops sand, no matter what tool clears it.");
     } catch (error) {}
   });
 } catch (error) {}
 
 try {
-  api.events.on("scene:game:started", () => {
-    install();
-  });
+  api.events.on("scene:game:started", () => install());
 } catch (error) {}
