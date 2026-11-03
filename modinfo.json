@@ -1,0 +1,22 @@
+{
+  "manifestVersion": 1,
+  "id": "laser-stone-to-sand",
+  "name": "Laser Stone to Sand",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "entry": "main.js",
+  "workerEntry": "worker.js",
+  "description": "Stone drops one sand when the mining laser destroys it. The drill and void gun are unchanged.",
+  "author": "laser-stone-to-sand",
+  "gameVersion": {
+    "minimum": "0.6.0"
+  },
+  "configSchema": {
+    "enabled": {
+      "type": "boolean",
+      "default": true,
+      "label": "Drop sand from lasered stone",
+      "description": "When on, every stone cell destroyed by the laser leaves one sand behind."
+    }
+  }
+}
