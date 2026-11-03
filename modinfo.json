@@ -1,12 +1,12 @@
 {
   "manifestVersion": 1,
   "id": "laser-stone-to-sand",
-  "name": "Laser Stone to Sand",
-  "version": "1.0.0",
+  "name": "Stone to Sand",
+  "version": "1.1.0",
   "apiVersion": 1,
   "entry": "main.js",
   "workerEntry": "worker.js",
-  "description": "Stone drops one sand when the mining laser destroys it. The drill and void gun are unchanged.",
+  "description": "Any tool or mod that destroys stone drops a pile of sand. Does not replace other mods' dig profiles.",
   "author": "laser-stone-to-sand",
   "gameVersion": {
     "minimum": "0.6.0"
@@ -15,8 +15,17 @@
     "enabled": {
       "type": "boolean",
       "default": true,
-      "label": "Drop sand from lasered stone",
-      "description": "When on, every stone cell destroyed by the laser leaves one sand behind."
+      "label": "Drop sand when stone is destroyed",
+      "description": "Applies to the laser, drill, void gun, and any other mod that clears stone."
+    },
+    "sandPerStone": {
+      "type": "number",
+      "default": 6,
+      "min": 1,
+      "max": 16,
+      "step": 1,
+      "label": "Sand per stone cell",
+      "description": "How many sand grains each destroyed stone cell tries to leave behind."
     }
   }
 }
